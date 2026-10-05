@@ -16,6 +16,11 @@
   毫米制闭合轮廓及该片每条有效关系的新边缘标记，以现有位姿校验受影响组
   误差与碰撞；预览不落库，确认时重新校验同一输入并原子更新，位姿、关系
   ID、分组、已撤销历史不变，装配版本只 +1（详见 revision.py）。
+- 版本历史（/api/history）：每次成功变更在提交前把装配状态整体存为不可改
+  的版本快照（与变更同一事务，预览与失败操作不留快照）；可按版查看历史
+  装配，先预览恢复后的完整装配及其与当前版的差异（不改数据），确认时携带
+  预览依据的当前版本号，原子恢复该版碎片与关系的原 ID 及状态并重算连通
+  组，装配版本只 +1 并留下新快照，旧快照仍可查（详见 history.py）。
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import geometry, revision, trial
+from . import geometry, history, revision, trial
 from .database import DB
 from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
@@ -102,6 +107,10 @@ class RevisionIn(BaseModel):
     # 本片每一条有效关系的新边缘标记（遗漏有效关系会被整次拒绝）
     relations: list[RevisionRelationIn] = Field(default_factory=list)
     expected_version: int
+
+
+class RestoreIn(BaseModel):
+    expected_version: int     # 预览依据的当前装配版本
 
 
 # ---------------------------------------------------------------- 拼接演算
@@ -473,6 +482,91 @@ def commit_trial(payload: TrialIn):
             raise HTTPException(500, "内部错误，本次操作未生效")
     return {"ok": True, "version": new_version, "committed_steps": len(sim["steps"]),
             "relation_ids": cid_map, "assembly": d.assembly_state()}
+
+
+# ---------------------------------------------------------------- 版本历史
+
+def _load_snapshot_or_404(d: DB, version: int) -> dict:
+    snap = d.get_snapshot(version)
+    if snap is None:
+        raise HTTPException(404, f"历史版本 v{version} 不存在（无此快照）")
+    return snap
+
+
+@app.get("/api/history")
+def list_history():
+    """版本历史清单：全部不可改快照的摘要（新→旧），含当前版本号。"""
+    d = get_db()
+    current = d.version()
+    return {
+        "current_version": current,
+        "snapshots": [
+            {**s, "is_current": s["version"] == current}
+            for s in reversed(d.list_snapshots())
+        ],
+    }
+
+
+@app.get("/api/history/{version}")
+def get_history_version(version: int):
+    """查看历史版：碎片轮廓/位姿、有效及已撤销关系、连通组（只读，不改数据）。"""
+    d = get_db()
+    snap = _load_snapshot_or_404(d, version)
+    asm = history.assembly_from_snapshot(snap["data"], snap["version"])
+    return {**asm,
+            "created_at": snap["created_at"],
+            "current_version": d.version(),
+            "is_current": snap["version"] == d.version()}
+
+
+@app.post("/api/history/{version}/restore/preview")
+def preview_restore(version: int, payload: RestoreIn):
+    """预览恢复：恢复后的完整装配 + 与当前版的碎片/关系差异，不改数据。
+
+    expected_version 为预览依据的当前装配版本，过期返回 409；目标历史版
+    不存在返回 404。
+    """
+    d = get_db()
+    with d.lock:
+        _check_version(d, payload.expected_version)
+        snap = _load_snapshot_or_404(d, version)
+        target = history.assembly_from_snapshot(snap["data"], snap["version"])
+        current = d.assembly_state()
+        return {
+            "ok": True,
+            "target_version": snap["version"],
+            "target_created_at": snap["created_at"],
+            "base_version": payload.expected_version,
+            "is_current": snap["version"] == d.version(),
+            "assembly": target,
+            "diff": history.diff_assembly(target, current),
+        }
+
+
+@app.post("/api/history/{version}/restore/confirm", status_code=201)
+def confirm_restore(version: int, payload: RestoreIn):
+    """确认恢复：原子恢复目标版碎片与关系的原 ID 及状态，重算连通组。
+
+    须提交预览依据的当前版本号：版本过期（409）或目标版不存在（404）均
+    拒绝且不写入；成功时装配版本只递增一次并留下新快照，旧快照仍可查。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            snap = _load_snapshot_or_404(d, version)
+            d.restore_state(snap["data"])
+            new_version = d.bump_version()   # 只递增一次，并留下新快照
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次操作未生效")
+    return {"ok": True, "restored_from": version, "version": new_version,
+            "assembly": d.assembly_state()}
 
 
 # ---------------------------------------------------------------- 前端静态页

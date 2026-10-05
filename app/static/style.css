@@ -76,3 +76,4 @@ canvas.mini { width: 100%; height: 170px; border: 1px solid #cbbd9f; border-radi
 .oktxt { color: #2c6e2c; }
 .errtxt { color: #a02020; }
 .trial-fail { border-color: #e5a0a0; background: #fdecec; }
+.hist-sel { border-color: #8e44ad; box-shadow: 0 0 0 1px #8e44ad; }

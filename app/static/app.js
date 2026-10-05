@@ -7,13 +7,15 @@ const S = {
   fragments: [],
   groups: [],
   relations: [],
-  mode: 'view',                       // view | draw | relate | revise
+  mode: 'view',                       // view | draw | relate | revise | history
   cam: { scale: 6, ox: 0, oy: 0 },    // 像素/毫米 + 原点偏移
   draw: { name: '', points: [] },
   relate: { aId: null, bId: null, markersA: [], markersB: [], preview: null },
   // 轮廓修订会话：fid 修订片；points 编辑中的修订轮廓；relMarkers {rid: 局部标记}
   revise: null,
   trial: { steps: [], rehearsal: null, busy: false },
+  // 版本历史：list 快照摘要；selected/view 查看中的历史版；preview 恢复预览
+  history: { list: [], selected: null, view: null, preview: null },
   camInit: false,
 };
 
@@ -63,9 +65,11 @@ async function loadAssembly() {
   S.relations = data.relations;
   S.trial = { steps: [], rehearsal: null, busy: false };  // 刷新后旧试拼作废
   S.revise = null;                                        // 刷新后旧修订会话作废
+  S.history = { list: [], selected: null, view: null, preview: null };  // 历史查看同步作废
   $('#versionBadge').textContent = `版本 v${S.version}`;
   renderPanel();
   renderMain();
+  if (S.mode === 'history') loadHistory();   // 版本已变，重新拉取快照清单
 }
 
 function handleConflict(err) {
@@ -145,6 +149,64 @@ async function commitTrial() {
     setMessage(`试拼序列已整体确认（${res.committed_steps} 步），装配版本 v${res.version}`);
     clearTrial();
     applyAssembly(res.assembly);
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
+// ---------------------------------------------------------------- 版本历史
+async function loadHistory() {
+  try {
+    const data = await api('/api/history');
+    S.history.list = data.snapshots;
+  } catch (err) {
+    setMessage(detailText(err.detail), 'err');
+  }
+  renderPanel(); renderMain();
+}
+
+async function viewHistoryVersion(v) {
+  try {
+    const data = await api(`/api/history/${v}`);
+    S.history.selected = v;
+    S.history.view = data;          // 该版完整装配（只读展示，不改当前数据）
+    S.history.preview = null;
+    renderPanel(); renderMain();
+  } catch (err) {
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
+async function previewRestore(v) {
+  try {
+    const data = await api(`/api/history/${v}/restore/preview`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version }),
+    });
+    S.history.selected = v;
+    S.history.preview = data;
+    // 预览响应里的 assembly 即该历史版的完整装配，直接作为查看内容
+    S.history.view = { ...data.assembly, created_at: data.target_created_at,
+                       is_current: data.is_current };
+    renderPanel(); renderMain();
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
+async function confirmRestore(v) {
+  if (!confirm(`确认把装配恢复到历史版本 v${v} 的状态？\n当前碎片与关系将被该版快照整体替换（原 ID 与状态），装配版本 +1。`)) return;
+  try {
+    const res = await api(`/api/history/${v}/restore/confirm`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: S.version }),
+    });
+    setMessage(`已恢复到历史版本 v${res.restored_from} 的状态，装配版本 v${res.version}（旧快照仍可查）`);
+    S.history = { list: [], selected: null, view: null, preview: null };
+    applyAssembly(res.assembly);
+    switchMode('view');
   } catch (err) {
     if (err.status === 409) return handleConflict(err);
     setMessage(detailText(err.detail), 'err');
@@ -258,6 +320,25 @@ function renderMain() {
   ctx.clearRect(0, 0, w, h);
   drawGrid(w, h);
 
+  // 历史版本：淡色画当前装配作对照，实色画选中历史版 / 恢复预览的装配
+  if (S.mode === 'history') {
+    const hv = S.history.preview ? S.history.preview.assembly : S.history.view;
+    for (const f of S.fragments) drawFragment(f, { faint: true });
+    if (hv) {
+      for (const f of hv.fragments) drawFragment(f, {});
+      const byId = Object.fromEntries(hv.fragments.map(f => [f.id, f]));
+      for (const r of hv.relations.filter(r => r.active)) {
+        const fa = byId[r.fragment_a], fb = byId[r.fragment_b];
+        if (!fa || !fb) continue;
+        r.markers_a.forEach((m, i) => {
+          drawMarkerPair(applyPose(m, fa), applyPose(r.markers_b[i], fb), i,
+            '', '#8e44ad');
+        });
+      }
+    }
+    return;
+  }
+
   const pv = S.mode === 'relate' ? S.relate.preview : null;
   const pvIds = pv ? new Set(pv.placements.map(p => p.fragment_id)) : new Set();
   const revPv = S.mode === 'revise' ? S.revise.preview : null;
@@ -365,6 +446,7 @@ function renderPanel() {
   if (S.mode === 'view') el.innerHTML = viewPanelHTML();
   else if (S.mode === 'draw') el.innerHTML = drawPanelHTML();
   else if (S.mode === 'revise') el.innerHTML = revisePanelHTML();
+  else if (S.mode === 'history') el.innerHTML = historyPanelHTML();
   else el.innerHTML = relatePanelHTML();
   bindPanelEvents();
   if (S.mode === 'relate') drawMinis();
@@ -376,6 +458,7 @@ function renderPanel() {
     draw: '单击画布添加顶点（≥3 个）· 拖拽平移 · 滚轮缩放 · 保存时自动闭合',
     relate: '在左侧两个小图中点击轮廓边缘放置对应标记（每片 ≥2 处、数量一致），然后预览/采纳/加入试拼',
     revise: '在主画布单击添加修订轮廓顶点（≥3 个，保存时自动闭合）；在各关系小图中点击「本片」一侧的修订轮廓边缘放置新标记；先预览再确认',
+    history: '实色为选中的历史版 / 恢复预览装配（紫色为有效关系标记），淡色为当前装配 · 确认恢复后装配版本 +1 · 拖拽平移 · 滚轮缩放',
   }[S.mode];
 }
 
@@ -459,6 +542,109 @@ function trialPanelHTML() {
     ${stepCards || '<div class="small">在「新建拼接」中编排“建立关系”，或点关系旁的「试拼撤销」加入撤销步。预演不落库。</div>'}
     ${T.steps.length ? '<div class="row" style="margin:6px 0"><button class="act danger" id="btnTrialClear">清空序列</button></div>' : ''}
     ${resultHTML}`;
+}
+
+// ---------------------------------------------------------------- 版本历史面板
+const HIST_FIELD_LABELS = {
+  name: '名称', contour: '轮廓', pose: '位姿', active: '有效状态',
+  markers_a: '甲侧标记', markers_b: '乙侧标记', max_error: '最大误差',
+  fragment_a: '碎片甲', fragment_b: '碎片乙',
+};
+
+function histFragName(id) {
+  const cur = S.fragments.find(f => f.id === id);
+  if (cur) return cur.name;
+  const hv = S.history.view;
+  const hf = hv && hv.fragments.find(f => f.id === id);
+  return hf ? hf.name : `#${id}`;
+}
+
+function histChangeText(changes) {
+  return Object.entries(changes).map(([k, v]) => {
+    if (k === 'pose')
+      return `位姿 (${v.from.map(x => fmt(x)).join(', ')}) → (${v.to.map(x => fmt(x)).join(', ')})`;
+    if (k === 'contour')
+      return `轮廓顶点 ${v.from_vertices} → ${v.to_vertices}`;
+    if (k === 'active')
+      return `有效状态 ${v.from ? '有效' : '已撤销'} → ${v.to ? '有效' : '已撤销'}`;
+    return `${HIST_FIELD_LABELS[k] || k}：${JSON.stringify(v.from)} → ${JSON.stringify(v.to)}`;
+  }).join('；');
+}
+
+function histDiffHTML(diff) {
+  const fragLabel = x => `#${x.id} ${esc(x.name || histFragName(x.id))}`;
+  const relLabel = x =>
+    `#${x.id}（${esc(histFragName(x.fragment_a))} ↔ ${esc(histFragName(x.fragment_b))}）`;
+  const sec = (title, d, label) => {
+    const items = [];
+    d.only_in_target.forEach(x => items.push(`<li class="oktxt">＋ 恢复后重现：${label(x)}</li>`));
+    d.only_in_current.forEach(x => items.push(`<li class="errtxt">－ 恢复后移除：${label(x)}</li>`));
+    d.changed.forEach(x => items.push(
+      `<li>± ${label(x)}<div class="sub">${esc(histChangeText(x.changes))}</div></li>`));
+    return `<div class="card">
+      <div class="row"><b>${title}</b><span class="spacer"></span>
+        <span class="small">无变化 ${d.unchanged_count}</span></div>
+      ${items.length ? `<ul style="margin:4px 0 2px 16px">${items.join('')}</ul>`
+                     : '<div class="small">无差异</div>'}
+    </div>`;
+  };
+  return sec('碎片差异', diff.fragments, fragLabel)
+       + sec('关系差异', diff.relations, relLabel);
+}
+
+function historyPanelHTML() {
+  const H = S.history;
+  const cards = H.list.map(s => `
+    <div class="card ${s.version === H.selected ? 'hist-sel' : ''}">
+      <div class="row">
+        <span><b>v${s.version}</b>${s.is_current ? ' <span class="oktxt">（当前）</span>' : ''}</span>
+        <span class="spacer"></span>
+        <button class="act" data-hist-view="${s.version}">查看</button>
+        <button class="act" data-hist-preview="${s.version}">预览恢复</button>
+      </div>
+      <div class="sub">${s.created_at.slice(0, 19).replace('T', ' ')} ·
+        碎片 ${s.fragment_count} · 关系 ${s.relation_count}（有效 ${s.active_relation_count}）</div>
+    </div>`).join('') || '<div class="small">暂无历史快照。</div>';
+
+  let detail = '';
+  const hv = H.view;
+  if (hv) {
+    const groups = hv.groups.map(g => `G${g.id}: ${g.fragment_ids.join(', ')}`).join('；') || '（全部独立）';
+    const rels = hv.relations.map(r => `
+      <div class="card ${r.active ? '' : 'undone'}"><b>#${r.id}</b>
+        ${esc(histFragName(r.fragment_a))} ↔ ${esc(histFragName(r.fragment_b))}
+        <span class="sub">${r.active ? `有效 · ${r.markers_a.length} 对标记 · 最大误差 ${fmt(r.max_error, 3)} mm` : '已撤销'}</span>
+      </div>`).join('');
+    detail = `
+      <h2>版本 v${hv.version} 详情${hv.is_current ? '（即当前版本）' : ''}</h2>
+      <div class="small">快照时间 ${(hv.created_at || '').slice(0, 19).replace('T', ' ')} · 当前版本 v${S.version}</div>
+      <div class="small"><b>连通组</b>：${esc(groups)}</div>
+      <div class="small"><b>碎片</b>：${hv.fragments.map(f => `#${f.id} ${esc(f.name)}`).join('、') || '（空）'}</div>
+      ${rels || '<div class="small">该版无拼接关系。</div>'}`;
+  }
+
+  let pvHTML = '';
+  const P = H.preview;
+  if (P) {
+    pvHTML = `
+      <h2>恢复预览（目标 v${P.target_version}，不落库）</h2>
+      <div class="small">基于当前版本 v${P.base_version} 演算的差异；确认后装配版本
+        v${S.version} → v${S.version + 1}，旧快照全部保留。</div>
+      ${P.diff.summary.identical
+        ? '<div class="okbox">目标版本与当前装配内容完全一致，恢复仅留下新快照。</div>'
+        : histDiffHTML(P.diff)}
+      <div class="row" style="margin-top:6px">
+        <button class="act primary" id="btnHistConfirm">确认恢复到 v${P.target_version}</button>
+      </div>`;
+  }
+
+  return `
+    <h2>版本历史（${H.list.length} 个快照）</h2>
+    <div class="small">每次成功变更自动保存不可改快照；预览与失败操作不留快照。
+      选择历史版可查看其装配，并预览 / 确认恢复到该版状态。</div>
+    ${cards}
+    ${detail}
+    ${pvHTML}`;
 }
 
 function drawPanelHTML() {
@@ -633,6 +819,13 @@ function bindPanelEvents() {
   if (btnClear) btnClear.onclick = clearTrial;
   const btnCommit = document.getElementById('btnTrialCommit');
   if (btnCommit) btnCommit.onclick = commitTrial;
+
+  document.querySelectorAll('[data-hist-view]').forEach(b =>
+    b.onclick = () => viewHistoryVersion(+b.dataset.histView));
+  document.querySelectorAll('[data-hist-preview]').forEach(b =>
+    b.onclick = () => previewRestore(+b.dataset.histPreview));
+  const btnHistConfirm = document.getElementById('btnHistConfirm');
+  if (btnHistConfirm) btnHistConfirm.onclick = () => confirmRestore(S.history.preview.target_version);
 
   if (S.mode === 'draw') {
     $('#fragName').oninput = e => { S.draw.name = e.target.value; };
@@ -1056,6 +1249,7 @@ function switchMode(mode) {
     S.relate.bId = S.fragments[1].id;
   }
   renderPanel(); renderMain();
+  if (mode === 'history') loadHistory();   // 进入历史页时拉取最新快照清单
 }
 document.querySelectorAll('.mode-btn').forEach(b =>
   b.addEventListener('click', () => switchMode(b.dataset.mode)));

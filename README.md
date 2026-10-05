@@ -30,7 +30,16 @@
   轮廓、相关标记与误差——位姿、关系 ID、连通分组与已撤销历史均不变，
   装配版本只 +1。遗漏任何有效关系、任一校验失败均整次拒绝；版本过期
   返回 409。
-- **乐观并发**：采纳 / 撤销 / 删除 / 试拼确认 / 轮廓修订确认携带期望版本号，过期版本返回 409 冲突提示。
+- **版本历史与恢复**：碎片录入 / 删除、拼接采纳 / 撤销、试拼确认、轮廓
+  修订确认等**每次成功变更**都与装配数据在同一事务内原子保存一份不可改
+  的版本快照（功能启用时先把当前状态记为基线；预览与失败操作不产生
+  快照）。可按版本查看历史装配的碎片轮廓、位姿、有效及已撤销关系和连通
+  组；选择历史版可先**预览**恢复后的完整装配及其与当前版的碎片、关系
+  差异（不改当前数据），确认时须提交预览依据的当前版本号——版本过期
+  （409）或目标版不存在（404）均拒绝且不写入；成功时原子恢复该版碎片
+  与关系的原 ID 及状态、重算连通组，装配版本只递增一次并留下新快照，
+  旧快照仍可查。
+- **乐观并发**：采纳 / 撤销 / 删除 / 试拼确认 / 轮廓修订确认 / 恢复确认携带期望版本号，过期版本返回 409 冲突提示。
 
 ## 一键启动（Docker Compose）
 
@@ -91,6 +100,18 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
    - 预览通过后点「**确认修订**」：服务器用同一输入重新校验，原子更新
      轮廓、相关标记与误差；位姿、关系 ID、连通分组、已撤销历史均不变，
      装配版本只 +1；任何冲突整次拒绝且没有任何变化，版本过期按提示刷新。
+8. **历史版本**（按版查看与恢复）：
+   - 点顶栏「**历史版本**」进入快照清单（每次成功变更自动留一份不可改
+     快照，预览与失败操作不留快照）；
+   - 点「**查看**」：主画布以实色显示该版完整装配（紫色为当时的有效
+     关系标记），淡色为当前装配作对照，侧栏列出该版碎片、连通组与
+     有效 / 已撤销关系；
+   - 点「**预览恢复**」：侧栏显示恢复后与当前版的碎片、关系差异
+     （重现 / 移除 / 内容变化），主画布展示恢复后的装配，此时**不改
+     任何数据**；
+   - 点「**确认恢复**」：按预览依据的当前版本号提交，原子恢复该版碎片
+     与关系的原 ID 及状态并重算连通组，装配版本只 +1 并留下新快照；
+     版本过期或目标版不存在则拒绝且不写入，旧快照始终可查。
 
 ## API 概览
 
@@ -108,11 +129,15 @@ Compose 默认将数据库挂载到命名卷 `pottery-data` 持久化。
 | `POST` | `/api/trials/commit` | 有序试拼整组确认（原子，版本只 +1） |
 | `POST` | `/api/fragments/{id}/revision/preview` | 轮廓修订预览（逐条误差/冲突，不落库） |
 | `POST` | `/api/fragments/{id}/revision/confirm` | 轮廓修订确认（重新校验同一输入，原子更新，版本只 +1） |
+| `GET` | `/api/history` | 版本历史清单（全部不可改快照摘要 + 当前版本号） |
+| `GET` | `/api/history/{version}` | 查看历史版装配（轮廓/位姿/有效及已撤销关系/连通组） |
+| `POST` | `/api/history/{version}/restore/preview` | 恢复预览（恢复后装配 + 与当前版差异，不落库） |
+| `POST` | `/api/history/{version}/restore/confirm` | 恢复确认（原子恢复原 ID 及状态，版本只 +1，留新快照） |
 
 错误约定：`400` 校验拒绝（轮廓自交 / 标记重合 / 标记不在边缘 / 标记数量
 不一致 / 遗漏有效关系 / 误差超限 / 碰撞 / 空序列 / 撤销目标非法），`404`
-对象不存在（碎片、关系缺失），`409` 版本冲突或重复撤销，`422` 请求体
-结构不合法。
+对象不存在（碎片、关系、历史版本快照缺失），`409` 版本冲突或重复撤销，
+`422` 请求体结构不合法。
 
 ## 有序试拼 API
 
@@ -272,15 +297,102 @@ curl -X POST http://localhost:8000/api/fragments/1/revision/confirm \
   本片的关系、同关系重复提交、遗漏有效关系、标记数量不一致 / 不足 2 处 /
   同片重合 / 不在修订轮廓边缘 → `400`。
 
+## 版本历史与恢复 API
+
+每次成功变更（碎片录入 / 删除、拼接采纳 / 撤销、试拼整组确认、轮廓修订
+确认、恢复确认）在提交前把装配状态整体写入一份以版本号为主键的**不可改
+快照**（与变更同一事务，原子生效）；功能启用时若尚无快照，先把当前状态
+记为基线。预览与失败（回滚）的操作不产生快照。快照只增不改：恢复历史版
+只会在新版本号上留下新快照，旧快照始终可查。
+
+### 快照清单与按版查看（只读）
+
+```bash
+# 清单：全部快照摘要（新→旧），含当前版本号
+curl http://localhost:8000/api/history
+# {"current_version": 4,
+#  "snapshots": [{"version": 4, "created_at": "...", "fragment_count": 3,
+#                 "relation_count": 1, "active_relation_count": 0,
+#                 "is_current": true}, ...]}
+
+# 查看历史版 v2：碎片轮廓/位姿、有效及已撤销关系、连通组（与 /api/assembly 同形）
+curl http://localhost:8000/api/history/2
+# {"version": 2, "current_version": 4, "is_current": false,
+#  "created_at": "...", "fragments": [...], "groups": [...], "relations": [...]}
+```
+
+历史版不存在返回 `404`；两个端点均不改数据。
+
+### 预览恢复（不落库）
+
+```bash
+curl -X POST http://localhost:8000/api/history/2/restore/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 4}'          # 预览依据的当前装配版本
+```
+
+```jsonc
+{
+  "ok": true,
+  "target_version": 2,                  // 目标历史版
+  "base_version": 4,                    // 预览依据的当前版本（确认时须原样提交）
+  "is_current": false,
+  "assembly": { "version": 2, "fragments": ["..."], "groups": ["..."],
+                "relations": ["..."] }, // 恢复后的完整装配（连通组已按该版重算）
+  "diff": {                             // 与当前版的差异（from=当前，to=恢复后）
+    "fragments": {
+      "only_in_target":  [{"id": 4, "name": "陶片D"}],   // 恢复后重现
+      "only_in_current": [],                             // 恢复后移除
+      "changed": [{"id": 1, "name": "陶片A-左半",
+                   "changes": {"pose": {"from": [0,0,0], "to": [3,1,0.2]}}}],
+      "unchanged_count": 2
+    },
+    "relations": {
+      "only_in_target": [], "only_in_current": [],
+      "changed": [{"id": 1, "fragment_a": 1, "fragment_b": 2,
+                   "changes": {"active": {"from": false, "to": true}}}],
+      "unchanged_count": 0
+    },
+    "summary": {"fragments_to_restore": 1, "fragments_to_remove": 0,
+                "fragments_to_change": 0, "relations_to_restore": 0,
+                "relations_to_remove": 0, "relations_to_change": 1,
+                "identical": false}
+  }
+}
+```
+
+`expected_version` 过期返回 `409`，目标历史版不存在返回 `404`；预览不写
+任何数据，可反复调用。
+
+### 确认恢复（原子，版本只 +1）
+
+请求体与预览相同——须提交**预览依据的当前版本号**：
+
+```bash
+curl -X POST http://localhost:8000/api/history/2/restore/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 4}'
+# 201: {"ok": true, "restored_from": 2, "version": 5, "assembly": {...}}
+```
+
+- 成功 → `201`：原子恢复该版**碎片与关系的原 ID 及状态**（轮廓、位姿、
+  标记、有效 / 已撤销、时间戳），按恢复后的有效关系**重算连通组**，装配
+  版本只递增一次并留下新快照；旧快照仍可查，后续新建对象不会复用历史 id；
+- `expected_version` 过期 → `409`，目标历史版不存在 → `404`，均**不写入
+  任何变化**；
+- 目标版即当前版时差异为空（`summary.identical=true`），仍允许确认——
+  内容不变，仅版本 +1 并留下新快照。
+
 ## 项目结构
 
 ```
 app/
-  main.py          # FastAPI 路由、单条拼接、版本控制、试拼与轮廓修订端点
+  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/轮廓修订/版本历史端点
+  history.py       # 版本历史：快照装配重建（连通组重算）与恢复差异演算（只读）
   revision.py      # 轮廓修订：边缘标记校验、受影响组误差/碰撞演算（只读）
   trial.py         # 有序试拼：内存快照逐步推演 + 整组提交 + 位姿演算
   geometry.py      # 刚体配准（最小二乘）、轮廓/边缘标记校验、重叠检测
-  database.py      # SQLite 持久化、连通组重算
+  database.py      # SQLite 持久化、连通组重算、不可改版本快照存取与恢复
   static/          # 浏览器二维画布前端（原生 JS）
 Dockerfile
 docker-compose.yml
