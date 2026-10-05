@@ -16,6 +16,13 @@
   毫米制闭合轮廓及该片每条有效关系的新边缘标记，以现有位姿校验受影响组
   误差与碰撞；预览不落库，确认时重新校验同一输入并原子更新，位姿、关系
   ID、分组、已撤销历史不变，装配版本只 +1（详见 revision.py）。
+- 历史版本（/api/assembly/versions...）：每次成功变更都在同一事务内把
+  完整装配（碎片/关系/连通组）固化为不可改版本快照；启用时当前状态记为
+  基线。可查看任意历史版的碎片轮廓、位姿、有效及已撤销关系与连通组；
+  恢复前先预览恢复后的完整装配及其与当前版的碎片/关系差异（不写库），
+  确认须提交预览所依据的当前版本号，版本过期或目标版不存在均拒绝且不
+  写入；成功时原子恢复该版碎片与关系的原 ID 及状态、重算连通组，装配
+  版本只递增一次并留下新快照，旧快照仍可查（详见 history.py）。
 """
 from __future__ import annotations
 
@@ -28,7 +35,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import geometry, revision, trial
+from . import geometry, history, revision, trial
 from .database import DB
 from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
@@ -104,6 +111,11 @@ class RevisionIn(BaseModel):
     expected_version: int
 
 
+class RestoreIn(BaseModel):
+    # 预览所依据的当前装配版本；过期则 409 拒绝且不写入
+    expected_version: int
+
+
 # ---------------------------------------------------------------- 拼接演算
 
 def _load_pair(d: DB, fa_id: int, fb_id: int):
@@ -142,7 +154,24 @@ def seed_demo(d: DB):
     with d.lock:
         for name, contour in demo:
             d.insert_fragment(name, contour)
-        d.bump_version()
+        d.recompute_groups()
+        v = d.bump_version()
+        # 演示数据为启用版本历史后的首个状态：记为基线快照
+        d.save_snapshot(v, "baseline", d.assembly_state(), ignore=True)
+        d.conn.commit()
+
+
+def ensure_baseline(d: DB):
+    """启用版本历史：尚无任何快照时，把当前状态记为基线（不改数据/版本）。
+
+    兼容升级已有数据库：快照表为空时以当前版本补记一条不可改基线快照；
+    已存在快照（如演示数据已在 seed_demo 内记录）则保留原快照不动。
+    """
+    with d.lock:
+        if d.has_snapshot():
+            return
+        v = d.version()
+        d.save_snapshot(v, "baseline", d.assembly_state(), ignore=True)
         d.conn.commit()
 
 
@@ -152,6 +181,7 @@ async def lifespan(app: FastAPI):
     db = DB(DB_PATH)
     if SEED_DEMO_DATA:
         seed_demo(db)
+    ensure_baseline(db)
     yield
     db.conn.close()
 
@@ -169,11 +199,17 @@ def create_fragment(payload: FragmentIn):
     except geometry.GeometryError as e:
         raise HTTPException(400, str(e))
     with d.lock:
-        fid = d.insert_fragment(payload.name.strip(), contour)
-        d.bump_version()
-        d.conn.commit()
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            fid = d.insert_fragment(payload.name.strip(), contour)
+            v = d.bump_version()
+            d.save_snapshot(v, "create", d.assembly_state())
+            d.conn.commit()
+        except Exception:
+            d.conn.rollback()
+            raise
         return {"ok": True, "fragment": d.get_fragment(fid),
-                "version": d.version()}
+                "version": v}
 
 
 @app.get("/api/fragments")
@@ -192,12 +228,13 @@ def delete_fragment(fid: int, expected_version: int):
                 raise HTTPException(404, f"碎片 #{fid} 不存在")
             d.delete_fragment(fid)
             d.recompute_groups()
-            d.bump_version()
+            v = d.bump_version()
+            d.save_snapshot(v, "delete", d.assembly_state())
             d.conn.commit()
         except Exception:
             d.conn.rollback()
             raise
-    return {"ok": True, "assembly": d.assembly_state()}
+    return {"ok": True, "version": v, "assembly": d.assembly_state()}
 
 
 # ---------------------------------------------------------------- 轮廓修订 API
@@ -287,6 +324,7 @@ def confirm_revision(fid: int, payload: RevisionIn):
                                        up["max_error"])
             # 不调用 recompute_groups：分组必须保持不变
             new_version = d.bump_version()
+            d.save_snapshot(new_version, "revision", d.assembly_state())
             d.conn.commit()
         except HTTPException:
             d.conn.rollback()
@@ -359,7 +397,8 @@ def accept_relation(payload: AcceptIn):
             rid = d.insert_relation(fa["id"], fb["id"], ev["markers"][0],
                                     ev["markers"][1], max(ev["errors"]))
             d.recompute_groups()
-            d.bump_version()
+            v = d.bump_version()
+            d.save_snapshot(v, "accept", d.assembly_state())
             d.conn.commit()
         except HTTPException:
             d.conn.rollback()
@@ -367,7 +406,8 @@ def accept_relation(payload: AcceptIn):
         except Exception:
             d.conn.rollback()
             raise HTTPException(500, "内部错误，本次操作未生效")
-    return {"ok": True, "relation_id": rid, "assembly": d.assembly_state()}
+    return {"ok": True, "relation_id": rid, "version": v,
+            "assembly": d.assembly_state()}
 
 
 @app.post("/api/relations/{rid}/undo")
@@ -386,7 +426,8 @@ def undo_relation(rid: int, payload: UndoIn):
                     409, f"版本冲突：拼接关系 #{rid} 已被撤销，请刷新后重试")
             d.undo_relation(rid)
             d.recompute_groups()
-            d.bump_version()
+            v = d.bump_version()
+            d.save_snapshot(v, "undo", d.assembly_state())
             d.conn.commit()
         except HTTPException:
             d.conn.rollback()
@@ -394,7 +435,7 @@ def undo_relation(rid: int, payload: UndoIn):
         except Exception:
             d.conn.rollback()
             raise HTTPException(500, "内部错误，本次操作未生效")
-    return {"ok": True, "assembly": d.assembly_state()}
+    return {"ok": True, "version": v, "assembly": d.assembly_state()}
 
 
 @app.get("/api/relations")
@@ -464,6 +505,7 @@ def commit_trial(payload: TrialIn):
                     })
             cid_map = trial.commit_actions(d, sim)
             new_version = d.bump_version()
+            d.save_snapshot(new_version, "trial", d.assembly_state())
             d.conn.commit()
         except HTTPException:
             d.conn.rollback()
@@ -473,6 +515,121 @@ def commit_trial(payload: TrialIn):
             raise HTTPException(500, "内部错误，本次操作未生效")
     return {"ok": True, "version": new_version, "committed_steps": len(sim["steps"]),
             "relation_ids": cid_map, "assembly": d.assembly_state()}
+
+
+# ---------------------------------------------------------------- 历史版本
+
+def _load_snapshot(d: DB, version: int):
+    """取目标版本快照行与状态；不存在抛 404 version_not_found。"""
+    rows = d.conn.execute(
+        "SELECT version, source, created_at FROM snapshots WHERE version = ?",
+        (version,)).fetchall()
+    if not rows:
+        raise HTTPException(
+            404, detail={
+                "message": f"目标版本 v{version} 的快照不存在，无法查看或恢复",
+                "code": "version_not_found",
+                "version": version,
+                "current_version": d.version(),
+            })
+    meta = rows[0]
+    snap = d.get_snapshot_state(version)
+    return meta["source"], meta["created_at"], snap
+
+
+@app.get("/api/assembly/versions")
+def list_versions():
+    """历史版本清单：版本号、变更来源、快照时间（新版本在前）。
+
+    快照不可改、不可删；基线（启用时记录）为最早一条。
+    """
+    d = get_db()
+    with d.lock:
+        items = d.list_snapshot_versions()
+        current = d.version()
+    for it in items:
+        it["source_label"] = history.source_label(it["source"])
+        it["current"] = it["version"] == current
+    return {"current_version": current, "versions": items}
+
+
+@app.get("/api/assembly/versions/{version}")
+def get_version(version: int):
+    """查看某历史版的完整装配：碎片轮廓/位姿、连通组、有效及已撤销关系。
+
+    只读，不改当前数据。目标版本快照不存在 → 404 version_not_found。
+    """
+    d = get_db()
+    with d.lock:
+        source, created_at, snap = _load_snapshot(d, version)
+        return history.build_history_view(version, source, created_at, snap)
+
+
+@app.post("/api/assembly/versions/{version}/restore/preview")
+def preview_restore(version: int, payload: RestoreIn):
+    """恢复预览：展示恢复到该版后的完整装配及与当前版的碎片/关系差异。
+
+    不写库。期望版本过期 → 409；目标版不存在 → 404 version_not_found；
+    目标版即当前版 → 400（无需恢复）。
+    """
+    d = get_db()
+    with d.lock:
+        _check_version(d, payload.expected_version)
+        source, created_at, snap = _load_snapshot(d, version)
+        if version == d.version():
+            raise HTTPException(
+                400, detail={
+                    "message": f"目标版本 v{version} 即当前版本，无需恢复",
+                    "code": "target_is_current",
+                    "current_version": d.version(),
+                })
+        return history.build_restore_preview(
+            d.assembly_state(), version, source, created_at, snap)
+
+
+@app.post("/api/assembly/versions/{version}/restore/confirm", status_code=201)
+def confirm_restore(version: int, payload: RestoreIn):
+    """确认恢复：原子恢复目标版碎片与关系的原 ID 及状态。
+
+    - 必须提交预览所依据的当前版本号（expected_version），过期 → 409；
+    - 目标版快照不存在 → 404，不写入；目标版即当前版 → 400，不写入；
+    - 成功后重算连通组，装配版本只 +1，并留下 source=restore 的新快照；
+      旧快照全部保留仍可查；关系与碎片的原 ID、active/undone_at/created_at
+      及轮廓、标记、位姿均按该版原样恢复。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            _source, _created_at, snap = _load_snapshot(d, version)
+            current = d.version()
+            if version == current:
+                raise HTTPException(
+                    400, detail={
+                        "message": f"目标版本 v{version} 即当前版本，无需恢复",
+                        "code": "target_is_current",
+                        "current_version": current,
+                    })
+            d.restore_state(snap)
+            d.recompute_groups()
+            new_version = d.bump_version()
+            restored = d.assembly_state()
+            d.save_snapshot(new_version, "restore", restored)
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次操作未生效")
+    return {
+        "ok": True,
+        "restored_from_version": version,
+        "expected_version": payload.expected_version,
+        "version": new_version,
+        "assembly": restored,
+    }
 
 
 # ---------------------------------------------------------------- 前端静态页
